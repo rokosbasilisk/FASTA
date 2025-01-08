@@ -1,10 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-import math
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm  # For progress bar
 
 @triton.jit
 def fasta_kernel(
@@ -48,16 +44,18 @@ def fasta_kernel(
     k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)  # Shape: (BLOCK_SIZE, D)
 
     # Intra-block attention: exact computation using block-wise matmul
-    if row_block_idx == col_block_idx:
+    if tl.abs(row_block_idx - col_block_idx)<2:
         acc += tl.dot(q_block, tl.trans(k_block))
 
     # Inter-block attention:
-    if row_block_idx != col_block_idx:
-        q_vector = tl.sum(q_block, axis=1)  # Shape: (BLOCK_SIZE,)
-        k_vector = tl.sum(k_block, axis=1)  # Shape: (BLOCK_SIZE,)
+    else:
+        q_vector = tl.sum(q_block, axis=1) / D  # Manually calculate the mean
+        k_vector = tl.sum(k_block, axis=1) / D  # Manually calculate the mean
+        
+        # Outer product using mean vectors
         outer = q_vector[:, None] * k_vector[None, :]
-        acc += outer / (D ** 2)
-
+        acc += outer
+        
     # Calculate offsets for storing the attention weights
     offs_attn_i = row_start + tl.arange(0, BLOCK_SIZE)
     offs_attn_j = col_start + tl.arange(0, BLOCK_SIZE)
@@ -84,6 +82,7 @@ def fasta_attn(Q, K, block_size):
         torch.Tensor: Attention weights of shape (B, H, N, N)
     """
     B, H, N, D = Q.shape
+
     # Ensure tensors are contiguous
     Q = Q.contiguous()
     K = K.contiguous()
