@@ -44,18 +44,29 @@ def fasta_kernel(
     k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)  # Shape: (BLOCK_SIZE, D)
 
     # Intra-block attention: exact computation using block-wise matmul
-    if tl.abs(row_block_idx - col_block_idx)<2:
+    if tl.abs(row_block_idx - col_block_idx) < 2:
         acc += tl.dot(q_block, tl.trans(k_block))
 
     # Inter-block attention:
     else:
-        q_vector = tl.sum(q_block, axis=1) / D  # Manually calculate the mean
-        k_vector = tl.sum(k_block, axis=1) / D  # Manually calculate the mean
-        
-        # Outer product using mean vectors
-        outer = q_vector[:, None] * k_vector[None, :]
+        # Calculate the number of valid rows (avoid division by zero)
+        valid_row_count = tl.sum(q_mask, axis=1)
+        valid_row_count = tl.sum(valid_row_count)
+        valid_row_count = tl.where(valid_row_count == 0, 1, valid_row_count)  # Avoid division by zero
+
+        # Compute the average embedding for Q and K
+        q_vector = tl.sum(q_block, axis=0) / valid_row_count
+        k_vector = tl.sum(k_block, axis=0) / valid_row_count
+
+        # Compute the dot product (scalar value)
+        dot_product = tl.sum(q_vector * k_vector)
+
+        # Fill the entire grid with this value
+        outer = tl.full((BLOCK_SIZE, BLOCK_SIZE), dot_product, dtype=tl.float32)
+
+        # Accumulate the result
         acc += outer
-        
+
     # Calculate offsets for storing the attention weights
     offs_attn_i = row_start + tl.arange(0, BLOCK_SIZE)
     offs_attn_j = col_start + tl.arange(0, BLOCK_SIZE)
@@ -68,6 +79,7 @@ def fasta_kernel(
 
     # Store the computed attention weights with masking
     tl.store(attn_ptrs, acc, mask=mask)
+
 
 def fasta_attn(Q, K, block_size):
     """
