@@ -44,7 +44,7 @@ def fasta_kernel(
     k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)  # Shape: (BLOCK_SIZE, D)
 
     # Intra-block attention: exact computation using block-wise matmul
-    if tl.abs(row_block_idx - col_block_idx) < 2:
+    if tl.abs(row_block_idx - col_block_idx)<1:
         acc += tl.dot(q_block, tl.trans(k_block))
 
     # Inter-block attention:
