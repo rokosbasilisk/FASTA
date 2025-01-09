@@ -8,8 +8,7 @@ def fasta_kernel(
     B, H, N, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
     stride_qb, stride_qh, stride_q0, stride_q1,
     stride_kb, stride_kh, stride_k0, stride_k1,
-    stride_attnb, stride_attnh, stride_attn0, stride_attn1,
-    locality_threshold: tl.constexpr
+    stride_attnb, stride_attnh, stride_attn0, stride_attn1
 ):
     pid = tl.program_id(0)
     n_blocks = tl.cdiv(N, BLOCK_SIZE)
@@ -37,33 +36,22 @@ def fasta_kernel(
     q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)
     k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)
 
-    # Cache for the most recent diagonal block computation
-    diagonal_cache = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
-    diagonal_mean = 0.0  # Initialize as scalar
-    diagonal_var = 0.0   # Initialize as scalar
-
-    if tl.abs(row_block_idx - col_block_idx) < locality_threshold:
+    if True: #row_block_idx == col_block_idx:
         block_attn = tl.dot(q_block, tl.trans(k_block))
         acc += block_attn
-
-        # Store diagonal statistics in cache
-        diagonal_mean = tl.sum(block_attn) / (BLOCK_SIZE * BLOCK_SIZE)
-        diagonal_var = tl.sum((block_attn - diagonal_mean) * (block_attn - diagonal_mean)) / (BLOCK_SIZE * BLOCK_SIZE)
-        diagonal_cache = block_attn
     else:
-        q_mask_sum = tl.sum(q_mask)
-        q_mask_sum = tl.where(q_mask_sum == 0, 1.0, q_mask_sum)
-        q_summary = tl.sum(q_block, axis=0) / q_mask_sum
+        distance = tl.abs(row_block_idx - col_block_idx)
+        sampled_indices = D // (2 * distance)
+        sampled_indices = max(1, sampled_indices)  # Ensure at least one index is sampled
 
-        k_mask_sum = tl.sum(k_mask)
-        k_mask_sum = tl.where(k_mask_sum == 0, 1.0, k_mask_sum)
-        k_summary = tl.sum(k_block, axis=0) / k_mask_sum
+        # Manually sample indices by constructing a sampled mask
+        sampled_mask = tl.arange(0, D) % max(D // sampled_indices, 1) == 0
+        q_sampled = tl.load(q_ptrs, mask=sampled_mask[None, :], other=0.0)
+        k_sampled = tl.load(k_ptrs, mask=sampled_mask[None, :], other=0.0)
 
-        dot_product = tl.sum(q_summary * k_summary)
-        approx_attn = tl.full((BLOCK_SIZE, BLOCK_SIZE), dot_product, dtype=tl.float32)
-
-        # Normalize and scale based on cached diagonal block statistics
-        approx_attn = (approx_attn - diagonal_mean) / tl.sqrt(diagonal_var + 1e-6)
+        dot_product = tl.sum(q_sampled * k_sampled, axis=1)
+        sampled_mean = tl.sum(dot_product) / sampled_indices  # Compute mean explicitly
+        approx_attn = tl.full((BLOCK_SIZE, BLOCK_SIZE), sampled_mean, dtype=tl.float32)
 
         valid_mask = q_mask & k_mask.T
         approx_attn = tl.where(valid_mask, approx_attn, 0.0)
@@ -76,7 +64,7 @@ def fasta_kernel(
     tl.store(attn_ptrs, acc, mask=mask)
 
 
-def fasta_attn(Q, K, block_size, locality_threshold=2):
+def fasta_attn(Q, K, block_size):
     """
     Computes FASTA attention using Triton with optimized intra-block matmul and Gaussian-like spread.
 
@@ -84,7 +72,6 @@ def fasta_attn(Q, K, block_size, locality_threshold=2):
         Q (torch.Tensor): Query tensor of shape (B, H, N, D)
         K (torch.Tensor): Key tensor of shape (B, H, N, D)
         block_size (int): Size of attention blocks
-        locality_threshold (int): Threshold for locality comparison
 
     Returns:
         torch.Tensor: Attention weights of shape (B, H, N, N)
@@ -104,8 +91,8 @@ def fasta_attn(Q, K, block_size, locality_threshold=2):
         B, H, N, D, block_size,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
-        locality_threshold
+        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3)
     )
 
     return attn
+
