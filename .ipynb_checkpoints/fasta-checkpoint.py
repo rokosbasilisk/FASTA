@@ -8,8 +8,9 @@ def fasta_kernel(
     B, H, N, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
     stride_qb, stride_qh, stride_q0, stride_q1,
     stride_kb, stride_kh, stride_k0, stride_k1,
-    stride_attnb, stride_attnh, stride_attn0, stride_attn1
+    stride_attnb, stride_attnh, stride_attn0, stride_attn1,
 ):
+    # Get the program ID and compute batch, head, row, and column block indices
     pid = tl.program_id(0)
     n_blocks = tl.cdiv(N, BLOCK_SIZE)
     b_idx = pid // (H * n_blocks * n_blocks)
@@ -18,34 +19,44 @@ def fasta_kernel(
     row_block_idx = block_idx // n_blocks
     col_block_idx = block_idx % n_blocks
 
+    # Calculate the starting positions of the current block
     row_start = row_block_idx * BLOCK_SIZE
     col_start = col_block_idx * BLOCK_SIZE
 
+    # Create block offsets for Q and K
     offs_q = row_start + tl.arange(0, BLOCK_SIZE)
     offs_k = col_start + tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, D)
 
+    # Initialize the accumulator for attention weights
     acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
 
+    # Compute memory addresses for Q and K blocks
     q_ptrs = Q_ptr + b_idx * stride_qb + head_idx * stride_qh + offs_q[:, None] * stride_q0 + offs_d[None, :] * stride_q1
     k_ptrs = K_ptr + b_idx * stride_kb + head_idx * stride_kh + offs_k[:, None] * stride_k0 + offs_d[None, :] * stride_k1
 
+    # Create masks to handle boundary conditions
     q_mask = offs_q[:, None] < N
     k_mask = offs_k[:, None] < N
 
-    q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)
-    k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)
+    # Load Q and K blocks with masking
+    q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)  # Shape: (BLOCK_SIZE, D)
+    k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)  # Shape: (BLOCK_SIZE, D)
 
-    if tl.abs(row_block_idx - col_block_idx) < 1:
+    # Intra-block attention: exact computation using block-wise matmul
+    if tl.abs(row_block_idx - col_block_idx)<1:
         acc += tl.dot(q_block, tl.trans(k_block))
-    else:
-        valid_row_count = tl.sum(q_mask, axis=1)
-        valid_row_count = tl.sum(valid_row_count)
-        valid_row_count = tl.where(valid_row_count == 0, 1, valid_row_count)  # Avoid division by zero
 
+    # Inter-block attention:
+    else:
+        # Calculate the number of valid rows (avoid division by zero)
+        valid_row_count = tl.where(tl.sum(tl.sum(q_mask, axis=1)) == 0, 1, valid_row_count)
+        valid_col_count = tl.where(tl.sum(tl.sum(k_mask, axis=1)) == 0, 1, valid_col_count)  
         # Compute the average embedding for Q and K
         q_vector = tl.sum(q_block, axis=0) / valid_row_count
-        k_vector = tl.sum(k_block, axis=0) / valid_row_count
+        k_vector = tl.sum(k_block, axis=0) / valid_col_count
+        q_vector = tl.where(tl.abs(q_vector) < 1e-6, 0.0, q_vector)
+        k_vector = tl.where(tl.abs(k_vector) < 1e-6, 0.0, k_vector)
 
         # Compute the dot product (scalar value)
         dot_product = tl.sum(q_vector * k_vector)
@@ -56,12 +67,17 @@ def fasta_kernel(
         # Accumulate the result
         acc += outer
 
-    
+    # Calculate offsets for storing the attention weights
     offs_attn_i = row_start + tl.arange(0, BLOCK_SIZE)
     offs_attn_j = col_start + tl.arange(0, BLOCK_SIZE)
 
+    # Compute memory addresses for storing the attention weights
     attn_ptrs = attn_ptr + b_idx * stride_attnb + head_idx * stride_attnh + offs_attn_i[:, None] * stride_attn0 + offs_attn_j[None, :] * stride_attn1
+
+    # Create a mask to handle boundary conditions during storage
     mask = (offs_attn_i[:, None] < N) & (offs_attn_j[None, :] < N)
+
+    # Store the computed attention weights with masking
     tl.store(attn_ptrs, acc, mask=mask)
 
 
@@ -79,14 +95,18 @@ def fasta_attn(Q, K, block_size):
     """
     B, H, N, D = Q.shape
 
+    # Ensure tensors are contiguous
     Q = Q.contiguous()
     K = K.contiguous()
 
+    # Create output tensor
     attn = torch.empty((B, H, N, N), device=Q.device, dtype=Q.dtype)
 
+    # Calculate grid size
     n_blocks = triton.cdiv(N, block_size)
     grid = (B * H * n_blocks * n_blocks,)
 
+    # Launch kernel
     fasta_kernel[grid](
         Q, K, attn,
         B, H, N, D, block_size,
