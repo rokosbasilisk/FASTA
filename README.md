@@ -1,4 +1,4 @@
-# FASTA: Full Average Scaled Tiling Attention
+# FASTA: Fast Approximate Scaled Tiling Attention
 
 This project implements a sparse attention mechanism using Triton. The attention computation follows these methods:
 
