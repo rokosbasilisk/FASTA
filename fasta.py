@@ -35,10 +35,29 @@ def fasta_kernel(
 
     q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)
     k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)
-
     block_attn = tl.dot(q_block, tl.trans(k_block))
     acc += block_attn
 
+    if row_block_idx == col_block_idx:
+        block_attn = tl.dot(q_block, tl.trans(k_block))
+        acc += block_attn
+    else:
+        distance = tl.abs(row_block_idx - col_block_idx)
+        sampled_indices = D // (2 * distance)
+        sampled_indices = max(1, sampled_indices)  # Ensure at least one index is sampled
+
+        # Manually sample indices by constructing a sampled mask
+        sampled_mask = tl.arange(0, D) % max(D // sampled_indices, 1) == 0
+        q_sampled = tl.load(q_ptrs, mask=sampled_mask[None, :], other=0.0)
+        k_sampled = tl.load(k_ptrs, mask=sampled_mask[None, :], other=0.0)
+
+        dot_product = tl.sum(q_sampled * k_sampled, axis=1)
+        sampled_mean = tl.sum(dot_product) / sampled_indices  # Compute mean explicitly
+        approx_attn = tl.full((BLOCK_SIZE, BLOCK_SIZE), sampled_mean, dtype=tl.float32)
+
+        valid_mask = q_mask & k_mask.T
+        approx_attn = tl.where(valid_mask, approx_attn, 0.0)
+        acc += approx_attn
 
     offs_attn_i = row_start + tl.arange(0, BLOCK_SIZE)
     offs_attn_j = col_start + tl.arange(0, BLOCK_SIZE)
@@ -77,5 +96,4 @@ def fasta_attn(Q, K, block_size):
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3)
     )
-
     return attn
