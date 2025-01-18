@@ -64,6 +64,7 @@ def fasta_kernel(
     tl.store(attn_ptrs, acc, mask=mask)
 
 
+
 def fasta_attn(Q, K, block_size):
     """
     Computes FASTA attention using Triton with optimized intra-block matmul and Gaussian-like spread.
@@ -95,4 +96,3 @@ def fasta_attn(Q, K, block_size):
     )
 
     return attn
-
