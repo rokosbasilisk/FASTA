@@ -1,42 +1,240 @@
-### Multi-Faceted AI Problem: Building and Enhancing a Transformer Model with Custom Attention Mechanisms
+import time
+import math
+import torch
+from torch import nn
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import *
+from fasta import *
+from typing import *
+import logging
 
-You are tasked with designing, implementing, and evaluating a Transformer-based model for a new natural language processing (NLP) task. The task involves summarizing legal documents while retaining essential details and maintaining factual consistency. This is a high-stakes application, where incorrect summaries could lead to severe legal and financial consequences. The task's complexity is further increased due to the length of the documents, which often exceed the token limits of standard Transformer models.
+class ModifiedLlamaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-Your team has decided to modify the attention mechanism of a pre-trained Transformer model, such as Llama, to better handle this task. Below are the specific requirements and challenges you need to address:
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
 
-1. **Modified Attention Mechanism**:
-    - Your team is considering replacing the standard attention mechanism in the Transformer model with a custom attention mechanism (`ModifiedLlamaAttention`) that integrates efficient sparse attention and caching to handle long documents.
-    - The custom attention mechanism must be compatible with both pretraining and fine-tuning stages, ensuring that no degradation occurs in downstream tasks.
-    - How would you integrate and validate the `ModifiedLlamaAttention` in the Transformer architecture while preserving pre-trained weights and ensuring minimal disruption to the model's functionality?
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
 
-2. **Scaling to Long Sequences**:
-    - Legal documents often have sequences exceeding 20,000 tokens, far surpassing the typical 2,048-token limit of standard models.
-    - What strategies will you implement to extend the model's sequence length while keeping computational costs manageable? Would you use techniques like sparse attention, local-global attention patterns, or memory-efficient approximations such as Linformer, Reformer, or Longformer? Justify your choice.
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
-3. **Training Challenges**:
-    - Training the model with the new attention mechanism is producing unstable results, including high loss fluctuations and NaN values during backpropagation. What debugging strategies would you employ to identify and fix these issues? Could gradient clipping, learning rate adjustments, or changes in the optimizer help stabilize training?
+        # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
+        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
-4. **Performance Metrics**:
-    - The task requires measuring not only accuracy but also factual consistency in generated summaries. What evaluation metrics would you use to assess the model's performance comprehensively? Consider metrics like BLEU, ROUGE, and BERTScore, and propose new metrics tailored to factual consistency and legal domain-specific accuracy.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
 
-5. **Model Deployment**:
-    - The model must be deployed in a real-time environment where users can input long legal documents and receive a summary within 5 seconds. What optimization techniques, such as quantization, pruning, or model distillation, would you use to meet this latency requirement while maintaining accuracy?
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
-6. **Ethical and Practical Considerations**:
-    - Summarizing legal documents comes with risks of bias, misrepresentation, and factual errors. How would you design the system to minimize these risks? Propose methods to make the model interpretable and ensure it meets ethical guidelines.
+        # use -1 to infer num_heads and num_key_value_heads as they may vary if tensor parallel is used
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-7. **Attention Mechanism Replacement Validation**:
-    - Your implementation involves replacing the `LlamaAttention` module with `ModifiedLlamaAttention`. You observe that after replacement, the model's performance degrades significantly, even though the new mechanism should theoretically be equivalent to the original.
-    - Discuss potential reasons for this degradation. Could the issue lie in weight initialization, differences in implementation logic, or mismatched dimensions in input tensors? How would you systematically debug and resolve this issue?
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-8. **Integration with Pre-Trained Models**:
-    - Pre-trained models often include additional enhancements like RoPE (Rotary Position Embeddings), ALiBi (Attention with Linear Biases), or scaling adjustments. How would you ensure that `ModifiedLlamaAttention` integrates seamlessly with these features while maintaining compatibility with pre-trained checkpoints?
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-9. **Benchmarking**:
-    - To demonstrate the advantages of your custom attention mechanism, you need to benchmark it against the original attention mechanism on both standard NLP datasets (e.g., SQuAD, GLUE) and domain-specific datasets for legal document summarization.
-    - Design an experiment to compare these mechanisms, detailing the datasets, baselines, and statistical tests you would use to ensure robust conclusions.
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        attn_weights = fasta_attn(query_states, key_states, 128)/math.sqrt(self.head_dim)
 
-10. **Scaling Across Multi-GPU Systems**:
-    - The size of the documents and model architecture necessitates multi-GPU training and inference. How would you implement efficient data parallelism or model parallelism to handle this? Would approaches like tensor parallelism or pipeline parallelism be more suitable? Provide a detailed plan.
+        if attention_mask is not None:  # no matter the length, we just slice it
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
-Compose a detailed solution to this problem, addressing each challenge and explaining how the different components of your approach work together to create a robust and efficient system.
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+def replace_attention_modules(model):
+    """
+    Replaces the attention modules in the given model with ModifiedLlamaAttention modules,
+    ensuring all relevant parameters and attributes are copied.
+
+    Args:
+        model (torch.nn.Module): The model whose attention modules will be replaced.
+    """
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Module) and hasattr(module, "q_proj"):
+            parent_name = name.rsplit(".", 1)[0]
+            parent = dict(model.named_modules()).get(parent_name, None)
+
+            if parent is None:
+                logger.warning(f"Parent module not found for {name}, skipping replacement.")
+                continue
+
+            # Instantiate ModifiedLlamaAttention and copy weights
+            modified_attention = ModifiedLlamaAttention(module.config, module.layer_idx)
+
+            # Copy weights and biases for q_proj
+            modified_attention.q_proj.weight.data.copy_(module.q_proj.weight.data)
+            if module.q_proj.bias is not None:
+                modified_attention.q_proj.bias.data.copy_(module.q_proj.bias.data)
+
+            # Copy weights and biases for k_proj
+            modified_attention.k_proj.weight.data.copy_(module.k_proj.weight.data)
+            if module.k_proj.bias is not None:
+                modified_attention.k_proj.bias.data.copy_(module.k_proj.bias.data)
+
+            # Copy weights and biases for v_proj
+            modified_attention.v_proj.weight.data.copy_(module.v_proj.weight.data)
+            if module.v_proj.bias is not None:
+                modified_attention.v_proj.bias.data.copy_(module.v_proj.bias.data)
+
+            # Copy weights and biases for o_proj
+            modified_attention.o_proj.weight.data.copy_(module.o_proj.weight.data)
+            if module.o_proj.bias is not None:
+                modified_attention.o_proj.bias.data.copy_(module.o_proj.bias.data)
+
+            # Preserve additional attributes, if any
+            for attr_name in dir(module):
+                if not attr_name.startswith("_") and not hasattr(modified_attention, attr_name):
+                    setattr(modified_attention, attr_name, getattr(module, attr_name))
+
+            # Replace the module and log the replacement
+            setattr(parent, name.split(".")[-1], modified_attention)
+            logger.info(f"Replaced {name} with ModifiedLlamaAttention")
+
+    torch.cuda.empty_cache()  # Clear unused memory after replacement
+    logger.info("Attention module replacement complete.")
+
+
+def compute_perplexity(model, tokenizer, text, device, max_length=512):
+    """
+    Computes perplexity for text using batching to reduce memory overhead,
+    and returns the generated output text.
+
+    Args:
+        model: The language model.
+        tokenizer: The tokenizer for the model.
+        text (str): The input text.
+        device (torch.device): The device to run the computation on.
+        max_length (int): Maximum sequence length for each chunk.
+
+    Returns:
+        tuple: (perplexity, generated_text)
+    """
+    model.to(device)  # Move model to GPU
+    model.eval()  # Set model to evaluation mode
+
+    total_loss = 0.0
+    num_chunks = 0
+    generated_text = ""
+
+    for i in range(0, len(text), max_length):
+        chunk = text[i:i + max_length]
+        inputs = tokenizer(chunk, return_tensors="pt", truncation=True).to(device)
+
+        with torch.no_grad():
+            # Forward pass with labels to compute loss
+            outputs = model(**inputs, labels=inputs["input_ids"])
+            total_loss += outputs.loss.item()
+            num_chunks += 1
+
+            # Decode generated text
+            logits = outputs.logits  # Shape: (batch_size, sequence_length, vocab_size)
+            predicted_ids = torch.argmax(logits, dim=-1)  # Get the token IDs with highest probability
+            generated_chunk = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+            generated_text += generated_chunk + " "
+
+    model.to("cpu")  # Move model back to CPU after computation
+    torch.cuda.empty_cache()  # Free up GPU memory
+
+    avg_loss = total_loss / num_chunks
+    perplexity = math.exp(avg_loss)
+
+    return perplexity, generated_text.strip()
+
+# Load the tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+
+# Use GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Sample text
+text = open("sample_data.txt", "r").read()
+
+# Measure original model performance
+start_time = time.time()
+original_perplexity, output = compute_perplexity(model, tokenizer, text, device)
+original_time = time.time() - start_time
+
+replace_attention_modules(model)
+
+start_time = time.time()
+modified_perplexity, output_modified = compute_perplexity(model, tokenizer, text, device)
+modified_time = time.time() - start_time
+
+# Print results
+print(f"Original Perplexity: {original_perplexity}, Time: {original_time:.4f}s Output: {output[:100]}")
+print(f"Modified Perplexity: {modified_perplexity}, Time: {modified_time:.4f}s Output: {output_modified[:100]}")
