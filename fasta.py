@@ -35,13 +35,12 @@ def fasta_minhash_tiled_kernel_no_smem(
 
     row_start = row_block_idx * BLOCK_SIZE
     col_start = col_block_idx * BLOCK_SIZE
-    is_diag = (row_block_idx == col_block_idx)
 
     acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     offs_qN = row_start + tl.arange(0, BLOCK_SIZE)
     offs_kN = col_start + tl.arange(0, BLOCK_SIZE)
 
-    if is_diag:
+    if tl.abs(row_block_idx - col_block_idx)<2:
         # Diagonal blocks => tile over [D]
         n_chunks = (D + BLOCK_K - 1) // BLOCK_K
         for cid in range(n_chunks):
@@ -145,4 +144,3 @@ def fasta_minhash_tiled(Q, K, k_minhash=32, seed=0, block_size=32, block_k=32):
         attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
     )
     return attn
-
