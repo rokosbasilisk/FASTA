@@ -1,22 +1,32 @@
+import math
 import torch
 import triton
 import triton.language as tl
-import math
+
+def generate_minhash_indices(k, D, seed=0):
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    return torch.randint(0, D, (k,), generator=rng, dtype=torch.int32)
 
 def nearest_power_of_2(x):
-    """Find the nearest power of 2 greater than or equal to x."""
     return max(16, 2 ** round(math.log2(x)))
 
 @triton.jit
-def fasta_kernel(
-    Q_ptr, K_ptr, attn_ptr,
-    B, H, N, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-    stride_qb, stride_qh, stride_q0, stride_q1,
-    stride_kb, stride_kh, stride_k0, stride_k1,
-    stride_attnb, stride_attnh, stride_attn0, stride_attn1
+def fasta_minhash_tiled_kernel_no_smem(
+    Q_ptr, K_ptr, Attn_ptr,
+    minhash_indices_ptr,
+    K_MINHASH: tl.constexpr,
+    B: tl.constexpr, H: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, BLOCK_K: tl.constexpr,
+
+    # strides
+    stride_qB, stride_qH, stride_qN, stride_qD,
+    stride_kB, stride_kH, stride_kN, stride_kD,
+    stride_aB, stride_aH, stride_aN, stride_aD
 ):
     pid = tl.program_id(0)
-    n_blocks = tl.cdiv(N, BLOCK_SIZE)
+    n_blocks = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+
     b_idx = pid // (H * n_blocks * n_blocks)
     head_idx = (pid // (n_blocks * n_blocks)) % H
     block_idx = pid % (n_blocks * n_blocks)
@@ -25,66 +35,114 @@ def fasta_kernel(
 
     row_start = row_block_idx * BLOCK_SIZE
     col_start = col_block_idx * BLOCK_SIZE
-
-    offs_q = row_start + tl.arange(0, BLOCK_SIZE)
-    offs_k = col_start + tl.arange(0, BLOCK_SIZE)
-    offs_d = tl.arange(0, D)
+    is_diag = (row_block_idx == col_block_idx)
 
     acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    offs_qN = row_start + tl.arange(0, BLOCK_SIZE)
+    offs_kN = col_start + tl.arange(0, BLOCK_SIZE)
 
-    if row_block_idx == col_block_idx:
-        q_ptrs = Q_ptr + b_idx * stride_qb + head_idx * stride_qh + offs_q[:, None] * stride_q0 + offs_d[None, :] * stride_q1
-        k_ptrs = K_ptr + b_idx * stride_kb + head_idx * stride_kh + offs_k[:, None] * stride_k0 + offs_d[None, :] * stride_k1
+    if is_diag:
+        # Diagonal blocks => tile over [D]
+        n_chunks = (D + BLOCK_K - 1) // BLOCK_K
+        for cid in range(n_chunks):
+            c_start = cid * BLOCK_K
+            c_end   = tl.minimum(c_start + BLOCK_K, D)
 
-        q_mask = offs_q[:, None] < N
-        k_mask = offs_k[:, None] < N
+            offs_dQ = c_start + tl.arange(0, BLOCK_K)
+            offs_dK = c_start + tl.arange(0, BLOCK_K)
+            valid_mask_dQ = offs_dQ < c_end
+            valid_mask_dK = offs_dK < c_end
 
-        q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)
-        k_block = tl.load(k_ptrs, mask=k_mask, other=0.0)
+            q_ptrs = (Q_ptr
+                + b_idx * stride_qB
+                + head_idx * stride_qH
+                + offs_qN[:, None] * stride_qN
+                + offs_dQ[None, :] * stride_qD)
+            k_ptrs = (K_ptr
+                + b_idx * stride_kB
+                + head_idx * stride_kH
+                + offs_kN[:, None] * stride_kN
+                + offs_dK[None, :] * stride_kD)
 
-        # Ensure valid dimensions for tl.dot
-        assert q_block.shape[-1] >= 16 and k_block.shape[-1] >= 16, \
-            f"Block dimensions are too small: {q_block.shape}, {k_block.shape}"
+            q_mask2d = (offs_qN[:, None] < N) & valid_mask_dQ[None, :]
+            k_mask2d = (offs_kN[:, None] < N) & valid_mask_dK[None, :]
 
-        block_attn = tl.dot(q_block, tl.trans(k_block))
-        acc += block_attn
+            q_tile = tl.load(q_ptrs, mask=q_mask2d, other=0.0)
+            k_tile = tl.load(k_ptrs, mask=k_mask2d, other=0.0)
+            acc += tl.dot(q_tile, tl.trans(k_tile))
 
-    offs_attn_i = row_start + tl.arange(0, BLOCK_SIZE)
-    offs_attn_j = col_start + tl.arange(0, BLOCK_SIZE)
-    attn_ptrs = attn_ptr + b_idx * stride_attnb + head_idx * stride_attnh + offs_attn_i[:, None] * stride_attn0 + offs_attn_j[None, :] * stride_attn1
-    mask = (offs_attn_i[:, None] < N) & (offs_attn_j[None, :] < N) & (row_block_idx == col_block_idx)
-    tl.store(attn_ptrs, acc, mask=mask)
+        acc *= 1.0 / tl.sqrt(float(D))
+    else:
+        # Off-diagonal => tile over k_minhash
+        n_chunks = (K_MINHASH + BLOCK_K - 1) // BLOCK_K
+        for cid in range(n_chunks):
+            c_start = cid * BLOCK_K
+            c_end   = tl.minimum(c_start + BLOCK_K, K_MINHASH)
 
-def fasta_attn(Q, K):
-    """
-    Computes FASTA attention using Triton with optimized intra-block matmul.
+            dims_idx = c_start + tl.arange(0, BLOCK_K)
+            valid_mask_dims = dims_idx < c_end
+            dims_chunk_ptr = minhash_indices_ptr + dims_idx
+            dims_chunk = tl.load(dims_chunk_ptr, mask=valid_mask_dims, other=0)
+            dims_2d = tl.reshape(dims_chunk, (1, BLOCK_K))
 
-    Args:
-        Q (torch.Tensor): Query tensor of shape (B, H, N, D)
-        K (torch.Tensor): Key tensor of shape (B, H, N, D)
+            row_offs_2d = tl.reshape(offs_qN, (BLOCK_SIZE, 1))
+            col_offs_2d = tl.reshape(offs_kN, (BLOCK_SIZE, 1))
 
-    Returns:
-        torch.Tensor: Attention weights of shape (B, H, N, N)
-    """
+            q_ptrs = (Q_ptr
+                + b_idx * stride_qB
+                + head_idx * stride_qH
+                + row_offs_2d * stride_qN
+                + dims_2d * stride_qD)
+            k_ptrs = (K_ptr
+                + b_idx * stride_kB
+                + head_idx * stride_kH
+                + col_offs_2d * stride_kN
+                + dims_2d * stride_kD)
+
+            row_mask_q = (row_offs_2d < N)
+            col_mask_k = (col_offs_2d < N)
+            dim_mask   = (dims_2d < D) & valid_mask_dims[None, :]
+            q_mask_2d  = row_mask_q & dim_mask
+            k_mask_2d  = col_mask_k & dim_mask
+
+            q_tile = tl.load(q_ptrs, mask=q_mask_2d, other=0.0)
+            k_tile = tl.load(k_ptrs, mask=k_mask_2d, other=0.0)
+            acc += tl.dot(q_tile, tl.trans(k_tile))
+
+        # Scale by sqrt(D)/K_MINHASH to match diagonal magnitude
+        acc *= tl.sqrt(float(D)) / float(K_MINHASH)
+
+    # Store
+    offs_i = row_start + tl.arange(0, BLOCK_SIZE)
+    offs_j = col_start + tl.arange(0, BLOCK_SIZE)
+    out_ptrs = (Attn_ptr
+        + b_idx * stride_aB
+        + head_idx * stride_aH
+        + offs_i[:, None] * stride_aN
+        + offs_j[None, :] * stride_aD)
+    mask_out = (offs_i[:, None] < N) & (offs_j[None, :] < N)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+def fasta_minhash_tiled(Q, K, k_minhash=32, seed=0, block_size=32, block_k=32):
     B, H, N, D = Q.shape
-
-    # Adjust block_size to the nearest power of 2 to sqrt(N)
-    block_size = min(nearest_power_of_2(math.sqrt(N)), N)
-
-    Q = Q.contiguous()
-    K = K.contiguous()
-
+    dims = generate_minhash_indices(k_minhash, D, seed).to(Q.device)
     attn = torch.zeros((B, H, N, N), device=Q.device, dtype=Q.dtype)
-
-    n_blocks = triton.cdiv(N, block_size)
+    n_blocks = (N + block_size - 1) // block_size
     grid = (B * H * n_blocks * n_blocks,)
 
-    fasta_kernel[grid](
-        Q, K, attn,
-        B, H, N, D, block_size,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3)
+    Qc = Q.contiguous()
+    Kc = K.contiguous()
+
+    fasta_minhash_tiled_kernel_no_smem[grid](
+        Qc, Kc, attn,
+        dims,
+        k_minhash,
+        B, H, N, D,
+        block_size,
+        block_k,
+        Qc.stride(0), Qc.stride(1), Qc.stride(2), Qc.stride(3),
+        Kc.stride(0), Kc.stride(1), Kc.stride(2), Kc.stride(3),
+        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
     )
     return attn
 
