@@ -40,7 +40,7 @@ def fasta_minhash_tiled_kernel_no_smem(
     offs_qN = row_start + tl.arange(0, BLOCK_SIZE)
     offs_kN = col_start + tl.arange(0, BLOCK_SIZE)
 
-    if tl.abs(row_block_idx - col_block_idx)<2:
+    if row_block_idx == col_block_idx:
         # Diagonal blocks => tile over [D]
         n_chunks = (D + BLOCK_K - 1) // BLOCK_K
         for cid in range(n_chunks):
@@ -122,8 +122,9 @@ def fasta_minhash_tiled_kernel_no_smem(
     mask_out = (offs_i[:, None] < N) & (offs_j[None, :] < N)
     tl.store(out_ptrs, acc, mask=mask_out)
 
-def fasta_minhash_tiled(Q, K, k_minhash=32, seed=0, block_size=32, block_k=32):
+def fasta_minhash_tiled(Q, K, k_minhash=32, seed=42,block_size = 64, block_k = 16):
     B, H, N, D = Q.shape
+
     dims = generate_minhash_indices(k_minhash, D, seed).to(Q.device)
     attn = torch.zeros((B, H, N, N), device=Q.device, dtype=Q.dtype)
     n_blocks = (N + block_size - 1) // block_size
@@ -132,6 +133,7 @@ def fasta_minhash_tiled(Q, K, k_minhash=32, seed=0, block_size=32, block_k=32):
     Qc = Q.contiguous()
     Kc = K.contiguous()
 
+    
     fasta_minhash_tiled_kernel_no_smem[grid](
         Qc, Kc, attn,
         dims,
