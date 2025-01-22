@@ -22,7 +22,7 @@ In the FASTA mechanism:
      \[
      Q_i \cdot K_i^\top
      \]
-   - If \( i \neq j \) (i.e., the indices are different), the average of \( Q_i \) and \( K_j \) is computed:
+   - If \( i \neq j \) (i.e., the indices are different), the average of \( Q_i \) and \( K_j \) is computed: (This is now replaced with minhash)
      \[
      \text{avg}(Q_i) \cdot \text{avg}(K_j)
      \]
